@@ -1,4 +1,5 @@
 {
   "name": "DW Spectrum Playback Card",
-  "render_readme": true
+  "render_readme": true,
+  "filename": "dw_spectrum_playback_card.js"
 }
