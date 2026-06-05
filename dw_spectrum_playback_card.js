@@ -59,6 +59,8 @@ const STYLES = `
   --rsm:     9px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   color: var(--text); display: block;
+  height: var(--ha-card-height, 100%);
+  min-height: 200px;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 .card {
@@ -66,7 +68,7 @@ const STYLES = `
   backdrop-filter: blur(28px) saturate(180%);
   -webkit-backdrop-filter: blur(28px) saturate(180%);
   border: 1px solid var(--border);
-  height: var(--dw-card-height, 520px);
+  height: 100%;
   display: flex; flex-direction: column;
 }
 
@@ -98,7 +100,7 @@ const STYLES = `
 }
 .grid-scroll::-webkit-scrollbar { display:none; }
 .grid-wrapper { display:flex; flex-direction:column; height:100%; }
-.cam-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+.cam-grid { display:grid; grid-template-columns:repeat(var(--dw-cams-per-row,2),1fr); gap:10px; }
 .cam-tile {
   position:relative; border-radius:var(--rsm); overflow:hidden;
   cursor:pointer; background:var(--surf); aspect-ratio:16/9;
@@ -119,6 +121,12 @@ const STYLES = `
   position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   font-size:12px; font-weight:700; letter-spacing:.08em; color:var(--red);
 }
+.tile-blocked {
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-size:11px; font-weight:700; letter-spacing:.06em; color:#ff8c00;
+  text-align:center; padding:4px;
+}
+.dot.blocked { background:#ff8c00; }
 .tile-loading {
   position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   font-size:12px; color:var(--text2);
@@ -362,6 +370,35 @@ const STYLES = `
 .dl-go ha-icon { --mdc-icon-size:18px; }
 .dl-status { font-size:12px; color:var(--text2); text-align:center; margin-top:8px; min-height:18px; }
 
+
+/* Playback speed */
+.speed-wrap { position:relative; display:flex; align-items:center; }
+.speed-hidden { visibility:hidden; pointer-events:none; }
+.speed-btn {
+  background:var(--surf2); border:1px solid var(--border); color:var(--text);
+  border-radius:8px; height:38px; padding:0 10px;
+  display:flex; align-items:center; justify-content:center;
+  cursor:pointer; font-size:12px; font-weight:700; letter-spacing:.04em;
+  transition:background .12s, border-color .12s;
+  white-space:nowrap;
+}
+@media (hover:hover) { .speed-btn:hover { background:var(--accent2); border-color:var(--accent); } }
+.speed-btn:active { background:var(--accent2); }
+.speed-btn.active { border-color:var(--accent); color:var(--accent); }
+.speed-drop {
+  position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
+  background:var(--surf); border:1px solid var(--border); border-radius:10px;
+  overflow:hidden; box-shadow:0 8px 24px rgba(0,0,0,.55);
+  display:none; flex-direction:column; min-width:80px; z-index:50;
+}
+.speed-drop.open { display:flex; }
+.speed-opt {
+  padding:9px 16px; font-size:13px; font-weight:500; cursor:pointer;
+  color:var(--text2); transition:background .1s, color .1s; text-align:center;
+}
+@media (hover:hover) { .speed-opt:hover { background:var(--surf2); color:var(--text); } }
+.speed-opt:active { background:var(--surf2); }
+.speed-opt.current { color:var(--accent); font-weight:700; background:rgba(74,158,255,.1); }
 /* Spinner */
 .spinner {
   display:inline-block; width:18px; height:18px;
@@ -410,7 +447,8 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     this._thumbTimer   = null;
     this._thumbLoading = new Set();
     this._gridScrollTop  = 0;       // remembered scroll position
-    this._offlineCams    = new Set(); // camera IDs known to be offline
+    this._offlineCams    = new Set();
+    this._blockedCams    = new Set();
     this._noArchiveCams  = new Set(); // camera IDs confirmed to have no archive
 
     // Detail state
@@ -430,6 +468,8 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     // Timeline
     this._tlZoom      = 60;
     this._searchQuery = "";
+    this._camsPerRow  = 2;
+    this._playbackRate = 1;
     this._footagePer  = [];
     this._footageCache     = [];     // accumulated footage periods across wider window (avoids re-fetch on scrub-back)
     this._footageLoadTimer = null;   // debounce timer for footage fetch
@@ -458,29 +498,33 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     const first = !this._hass;
     this._hass = h;
     if (first) this._loadData();
-    else if (this._view === "grid" && this._cameras.length) {
-      // Refresh offline states whenever HA pushes a state update
+    else {
       this._loadOfflineStates();
+      this._loadBlockedStates();
+    }
+    if (!first && this._view === "grid" && this._cameras.length) {
       // Patch dots and overlays in-place without a full re-render
       for (const cam of this._cameras) {
         const tile = this.shadowRoot.querySelector(`.cam-tile[data-cid="${cam.id}"]`);
         if (!tile) continue;
-        const offline = this._offlineCams.has(cam.id);
+        const offline  = this._offlineCams.has(cam.id);
+        const blocked  = this._blockedCams.has(cam.id);
         const dot = tile.querySelector(".dot");
-        if (dot) dot.className = `dot${offline ? " offline" : ""}`;
+        if (dot) dot.className = `dot${offline ? " offline" : blocked ? " blocked" : ""}`;
         let ol = tile.querySelector(".tile-offline");
+        let bl = tile.querySelector(".tile-blocked");
         if (offline && !ol) {
-          ol = document.createElement("div");
-          ol.className = "tile-offline";
-          ol.textContent = "OFFLINE";
+          ol = document.createElement("div"); ol.className = "tile-offline"; ol.textContent = "OFFLINE";
           tile.insertBefore(ol, tile.querySelector(".tile-bar"));
-          const img = tile.querySelector("img");
-          if (img) img.style.display = "none";
-          const ld = tile.querySelector(".tile-loading");
-          if (ld) ld.remove();
-        } else if (!offline && ol) {
-          ol.remove();
-        }
+          const img = tile.querySelector("img"); if (img) img.style.display = "none";
+          const ld = tile.querySelector(".tile-loading"); if (ld) ld.remove();
+        } else if (!offline && ol) { ol.remove(); }
+        if (blocked && !bl) {
+          bl = document.createElement("div"); bl.className = "tile-blocked"; bl.textContent = "STREAM BLOCKED FOR HA";
+          tile.insertBefore(bl, tile.querySelector(".tile-bar"));
+          const img2 = tile.querySelector("img"); if (img2) img2.style.display = "none";
+          const ld2 = tile.querySelector(".tile-loading"); if (ld2) ld2.remove();
+        } else if (!blocked && bl) { bl.remove(); }
       }
     }
   }
@@ -489,11 +533,15 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     if (this._config.default_timeline && [5,10,20,30,45,60].includes(this._config.default_timeline)) {
       this._tlZoom = this._config.default_timeline;
     }
+    if ([1,2,3].includes(this._config.cameras_per_row)) {
+      this._camsPerRow = this._config.cameras_per_row;
+    }
   }
-  static getCardSize()       { return 7; }
-  static getConfigElement() { return document.createElement("dw-spectrum-playback-card-editor"); }
+  getCardSize()              { return 5; }
+  getGridOptions()           { return { columns: 12, min_columns: 6, rows: 7, min_rows: 4 }; }
+  static getConfigElement()  { return document.createElement("dw-spectrum-playback-card-editor"); }
   static getStubConfig() {
-    return { show_download:true, show_calendar:true, show_motion:true, default_timeline:10, default_audio:false, show_search:true, show_badges:true };
+    return { show_download:true, show_calendar:true, show_motion:true, default_timeline:10, default_audio:false, show_search:true, show_badges:true, cameras_per_row:2 };
   }
 
   /* ── Data load */
@@ -510,8 +558,10 @@ class DwSpectrumPlaybackCard extends HTMLElement {
       const cfgId       = this._config?.entry_id;
       this._activeEntry = (cfgId && this._entries.find(e => e.entry_id === cfgId)) || this._entries[0];
       this._cameras     = this._activeEntry.cameras || [];
+      this._blockedCams = new Set(this._cameras.filter(c => c.stream_blocked).map(c => c.id));
       this._view        = "grid";
       this._loadOfflineStates();
+      this._loadBlockedStates();
       this._render();
       this._startGridThumbs();
     } catch(err) {
@@ -551,6 +601,51 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     }
   }
 
+  _loadBlockedStates() {
+    if (!this._hass) return;
+    const states = this._hass.states || {};
+    const justUnblocked = [], justBlocked = [];
+    for (const [entityId, state] of Object.entries(states)) {
+      if (!entityId.startsWith("switch.") || !entityId.includes("block_live_stream")) continue;
+      const camName = (state.attributes?.friendly_name || "")
+        .replace(/\s*block live stream in ha$/i, "").trim().toLowerCase();
+      for (const cam of this._cameras) {
+        if (cam.name.toLowerCase() === camName) {
+          if (state.state === "on") {
+            const wasUnblocked = !this._blockedCams.has(cam.id);
+            this._blockedCams.add(cam.id);
+            if (wasUnblocked) justBlocked.push(cam.id);
+          } else {
+            const wasBlocked = this._blockedCams.has(cam.id);
+            this._blockedCams.delete(cam.id);
+            if (wasBlocked) justUnblocked.push(cam.id);
+          }
+          break;
+        }
+      }
+    }
+    if (this._view === "detail" && this._activeCam) {
+      const id = this._activeCam.id;
+      if (justBlocked.includes(id)) {
+        this._stopLive(); this._stopArchiveVideo();
+        this._setVidStatus("STREAM BLOCKED FOR HA");
+        const el = this.shadowRoot?.querySelector(".vid-status");
+        if (el) { el.style.color = "#ff8c00"; el.style.fontSize = "16px"; el.style.fontWeight = "700"; }
+      } else if (justUnblocked.includes(id)) {
+        this._startLive();
+      }
+    }
+    if (justUnblocked.length && this._view === "grid" && this._hass) {
+      const tok = this._hass.auth?.data?.access_token;
+      for (const camId of justUnblocked) {
+        if (!this._thumbLoading.has(camId)) {
+          this._thumbLoading.add(camId);
+          this._fetchGridThumb(camId, tok).finally(() => this._thumbLoading.delete(camId));
+        }
+      }
+    }
+  }
+
   async _refreshGridThumbs() {
     if (!this._hass || !this._activeEntry || this._view !== "grid") return;
     const tok = this._hass.auth?.data?.access_token;
@@ -561,7 +656,8 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     }
   }
   async _fetchGridThumb(camId, tok) {
-    if (this._offlineCams.has(camId)) return; // skip fetch for offline cameras
+    if (this._offlineCams.has(camId)) return;
+    if (this._blockedCams.has(camId)) return;
     try {
       const id  = cleanId(camId);
       const e = this._activeEntry;
@@ -606,6 +702,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     this._activeCam      = cam;
     this._mode           = "live";
     this._isPlaying      = false;
+    this._playbackRate   = 1;
     this._footagePer     = [];
     this._footageCache   = [];
     this._motionPer      = [];
@@ -678,6 +775,20 @@ class DwSpectrumPlaybackCard extends HTMLElement {
    * reset each time a new camera is opened so the stream is retried.
    */
   _startLive() {
+    if (this._activeCam) {
+      if (this._offlineCams.has(this._activeCam.id)) {
+        this._setVidStatus("OFFLINE");
+        const el = this.shadowRoot?.querySelector(".vid-status");
+        if (el) { el.style.color = "var(--red)"; el.style.fontSize = "16px"; el.style.fontWeight = "700"; }
+        return;
+      }
+      if (this._blockedCams.has(this._activeCam.id)) {
+        this._setVidStatus("STREAM BLOCKED FOR HA");
+        const el = this.shadowRoot?.querySelector(".vid-status");
+        if (el) { el.style.color = "#ff8c00"; el.style.fontSize = "16px"; el.style.fontWeight = "700"; }
+        return;
+      }
+    }
     this._mode = "live";
     clearInterval(this._liveTimer);
     this._liveTimer = null;
@@ -926,6 +1037,12 @@ class DwSpectrumPlaybackCard extends HTMLElement {
 
   /* ── Archive mode (MP4 via DW media endpoint) */
   _playAt(ms) {
+    if (this._activeCam && this._blockedCams.has(this._activeCam.id)) {
+      this._setVidStatus("STREAM BLOCKED FOR HA");
+      const el = this.shadowRoot?.querySelector(".vid-status");
+      if (el) { el.style.color = "#ff8c00"; el.style.fontSize = "16px"; el.style.fontWeight = "700"; }
+      return;
+    }
     this._stopLive();
     this._mode        = "archive";
     this._playheadMs  = ms;
@@ -1006,7 +1123,10 @@ class DwSpectrumPlaybackCard extends HTMLElement {
 
   _setVidStatus(msg) {
     const el = this.shadowRoot.querySelector(".vid-status");
-    if (el) el.textContent = msg;
+    if (el) {
+      el.textContent = msg;
+      if (!msg) { el.style.color = ""; el.style.fontSize = ""; el.style.fontWeight = ""; }
+    }
   }
 
   _toggleMotion() {
@@ -1467,7 +1587,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     wrap.innerHTML = `
       <div class="hdr"><span class="hdr-title">DW Spectrum</span>${selH}${this._config?.show_search!==false?`<div class="search-wrap">${ic("mdi:magnify")}<input class="cam-search" type="text" placeholder="Search cameras…" value="${this._searchQuery||""}"><button class="search-clear" aria-label="Clear">✕</button></div>`:""}</div>
       <div class="grid-scroll">
-        ${(()=>{ const q=(this._searchQuery||"").toLowerCase(); const cams=q?this._cameras.filter(c=>c.name.toLowerCase().includes(q)):this._cameras; return cams.length===0?`<div class="no-cam">No cameras found.</div>`:`<div class="cam-grid">${cams.map(c=>this._tileHtml(c)).join("")}</div>`; })()}
+        ${(()=>{ const q=(this._searchQuery||"").toLowerCase(); const cams=q?this._cameras.filter(c=>c.name.toLowerCase().includes(q)):this._cameras; return cams.length===0?`<div class="no-cam">No cameras found.</div>`:`<div class="cam-grid" style="--dw-cams-per-row:${this._camsPerRow}">${cams.map(c=>this._tileHtml(c)).join("")}</div>`; })()}
       </div>`;
     if (multi) wrap.querySelector(".srv-sel").addEventListener("change", e => this._switchEntry(e.target.value));
     wrap.querySelectorAll(".cam-tile").forEach(t =>
@@ -1494,7 +1614,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
           const cams = q ? this._cameras.filter(c => c.name.toLowerCase().includes(q)) : this._cameras;
           scroll.innerHTML = cams.length === 0
             ? `<div class="no-cam">No cameras found.</div>`
-            : `<div class="cam-grid">${cams.map(c => this._tileHtml(c)).join("")}</div>`;
+            : `<div class="cam-grid" style="--dw-cams-per-row:${this._camsPerRow}">${cams.map(c => this._tileHtml(c)).join("")}</div>`;
           scroll.querySelectorAll(".cam-tile").forEach(t =>
             t.addEventListener("click", () => {
               const cam = this._cameras.find(c => c.id === t.dataset.cid);
@@ -1509,13 +1629,16 @@ class DwSpectrumPlaybackCard extends HTMLElement {
   _tileHtml(cam) {
     const src       = this._thumbUrls[cam.id] || "";
     const offline   = this._offlineCams.has(cam.id);
-    const loading   = !src && !offline;
+    const blocked   = this._blockedCams.has(cam.id);
+    const loading   = !src && !offline && !blocked;
+    const hideImg   = !src || offline || blocked;
     return `<div class="cam-tile" data-cid="${cam.id}">
-      <img data-cam="${cam.id}" src="${src}" alt="${cam.name}" style="${src&&!offline?"":"display:none"}">
+      <img data-cam="${cam.id}" src="${src}" alt="${cam.name}" style="${hideImg?"display:none":""}">
       ${loading  ? `<div class="tile-loading">Loading…</div>` : ""}
       ${offline  ? `<div class="tile-offline">OFFLINE</div>` : ""}
+      ${blocked  ? `<div class="tile-blocked">STREAM BLOCKED FOR HA</div>` : ""}
       <div class="tile-bar">
-        <span class="dot${offline?" offline":""}"></span>
+        <span class="dot${offline?" offline":blocked?" blocked":""}"></span>
         <span class="tile-name">${cam.name}</span>
       </div>
     </div>`;
@@ -1545,6 +1668,12 @@ class DwSpectrumPlaybackCard extends HTMLElement {
       <div class="transport">
         <div></div>
         <div class="transport-center">
+          <div class="speed-wrap${this._mode==="archive"?"":" speed-hidden"}">
+            <button class="speed-btn${this._playbackRate!==1?" active":""}">${this._playbackRate}x</button>
+            <div class="speed-drop">
+              ${[1,1.25,1.5,1.75,2].map(r=>`<div class="speed-opt${this._playbackRate===r?" current":""}" data-rate="${r}">${r}x</div>`).join("")}
+            </div>
+          </div>
           <button class="tb seek-back" title="−30s">${ic("mdi:rewind-30")}</button>
           <button class="tb primary play-btn">${ic("mdi:play")}</button>
           <button class="tb seek-fwd"  title="+30s">${ic("mdi:fast-forward-30")}</button>
@@ -1574,6 +1703,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     const isLive = this._mode === "live";
     this.shadowRoot?.querySelector(".live-badge")?.classList.toggle("is-live", isLive);
     this.shadowRoot?.querySelector(".live-text") ?.classList.toggle("is-live", isLive);
+    this.shadowRoot?.querySelector(".speed-wrap")?.classList.toggle("speed-hidden", isLive);
   }
 
   _bindPinchZoom(wrap) {
@@ -1675,6 +1805,31 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     r.querySelector(".play-btn")  ?.addEventListener("click", () => this._togglePlay());
     r.querySelector(".seek-back") ?.addEventListener("click", () => this._seekRelative(-30));
     r.querySelector(".seek-fwd")  ?.addEventListener("click", () => this._seekRelative(30));
+    const speedBtn  = r.querySelector(".speed-btn");
+    const speedDrop = r.querySelector(".speed-drop");
+    let speedTimer  = null;
+    const closeSpeed = () => { speedDrop?.classList.remove("open"); };
+    const resetSpeedTimer = () => { clearTimeout(speedTimer); speedTimer = setTimeout(closeSpeed, 3000); };
+
+    speedBtn?.addEventListener("click", () => {
+      const isOpen = speedDrop.classList.contains("open");
+      if (isOpen) { closeSpeed(); clearTimeout(speedTimer); }
+      else { speedDrop.classList.add("open"); resetSpeedTimer(); }
+    });
+
+    speedDrop?.querySelectorAll(".speed-opt").forEach(opt => {
+      opt.addEventListener("click", () => {
+        const rate = parseFloat(opt.dataset.rate);
+        this._playbackRate = rate;
+        const vid = r.querySelector(".arc-video");
+        if (vid) vid.playbackRate = rate;
+        if (speedBtn) { speedBtn.textContent = rate + "x"; speedBtn.classList.toggle("active", rate !== 1); }
+        speedDrop.querySelectorAll(".speed-opt").forEach(o => o.classList.toggle("current", parseFloat(o.dataset.rate) === rate));
+        closeSpeed();
+        clearTimeout(speedTimer);
+      });
+    });
+
     r.querySelector(".live-badge")?.addEventListener("click", () => this._startLive());
     r.querySelector(".live-text") ?.addEventListener("click", () => this._startLive());
     r.querySelector(".btn-motion")?.addEventListener("click", () => this._toggleMotion());
@@ -1859,6 +2014,11 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     return wrap;
   }
 
+  connectedCallback() {
+    this._resizeObserver = new ResizeObserver(() => this._drawTimeline());
+    this._resizeObserver.observe(this);
+  }
+
   disconnectedCallback() {
     this._stopGridThumbs();
     this._stopLive();
@@ -1866,6 +2026,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     clearTimeout(this._motionJumpTimer);
     clearInterval(this._liveClockTimer);
     this._thumbUrls = {};
+    if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
   }
 }
 
@@ -1948,6 +2109,14 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
       <div class="section">Video Overlays</div>
       <div class="row"><label>Show live/archive badge on video</label>
         <input type="checkbox" id="show_badges" ${c.show_badges!==false?"checked":""}></div>
+
+      <div class="section">Grid Layout</div>
+      <div class="row"><label>Cameras per row</label>
+        <select id="cameras_per_row">
+          <option value="1" ${c.cameras_per_row===1?"selected":""}>1 per row</option>
+          <option value="2" ${(c.cameras_per_row||2)===2?"selected":""}>2 per row</option>
+          <option value="3" ${c.cameras_per_row===3?"selected":""}>3 per row</option>
+        </select></div>
     `;
 
     const update = () => this._fire({
@@ -1959,6 +2128,7 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
       default_audio:    this.shadowRoot.getElementById("default_audio").checked,
       show_search:      this.shadowRoot.getElementById("show_search").checked,
       show_badges:      this.shadowRoot.getElementById("show_badges").checked,
+      cameras_per_row:  Number(this.shadowRoot.getElementById("cameras_per_row").value),
     });
 
     this.shadowRoot.querySelectorAll("input, select").forEach(el =>
