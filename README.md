@@ -74,5 +74,5 @@ show_motion: true
 ---
 
 ## Requirements
-- [DW Spectrum IPVMS integration](https://github.com/your-repo-here) installed and configured.
+- [DW Spectrum IPVMS integration](https://github.com/igraph100/dw_spectrum) installed and configured.
 - Home Assistant 2024.x or later.
