@@ -18,29 +18,12 @@
  */
 
 const CARD_TAG         = "dw-spectrum-playback-card";
-const THUMB_REFRESH_MS = 30_000;   // grid thumbnail refresh
-const LIVE_POLL_MS     = 2_000;    // live view frame poll
+const THUMB_REFRESH_MS = 30_000;   // grid thumbnail refresh cycle
+const THUMB_MAX_PARALLEL = 3;      // max grid thumbnail requests open at once (per card)
+const LIVE_POLL_MS     = 2_000;    // live JPEG fallback: pause after a good frame
+const LIVE_POLL_MAX_MS = 10_000;   // live JPEG fallback: max pause after slow/failed frames
+const LIVE_SLOW_MS     = 3_000;    // a frame that took longer than this counts as slow
 const TL_ZOOM_STEPS    = [2, 5, 10, 15, 30, 60, 120, 360, 720, 1440]; // minutes
-
-function isLocalUrl(url) {
-  try {
-    const h = new URL(url).hostname;
-    return h === 'localhost' || h === '127.0.0.1' ||
-           /^10\./.test(h) || /^192\.168\./.test(h) ||
-           /^172\.(1[6-9]|2\d|3[01])\./.test(h);
-  } catch { return false; }
-}
-
-function mediaUrl(entry, camId, params) {
-  const id = camId.replace(/[{}]/g, '');
-  const p  = new URLSearchParams(params);
-  if (isLocalUrl(entry.dw_url)) {
-    p.set('auth', entry.auth_param);
-    return entry.dw_url + '/media/' + id + '.mp4?' + p.toString();
-  }
-  p.set('token', entry.media_token);
-  return '/api/dw_spectrum/' + entry.entry_id + '/media/' + id + '?' + p.toString();
-}
 
 /* ─────────────────────────────────────────────── CSS */
 const STYLES = `
@@ -444,8 +427,20 @@ class DwSpectrumPlaybackCard extends HTMLElement {
 
     // Grid thumbnails
     this._thumbUrls    = {};
-    this._thumbTimer   = null;
-    this._thumbLoading = new Set();
+    this._thumbTimer   = null;      // setTimeout handle for the next refresh cycle
+    this._thumbStaggerTimer = null; // setTimeout handle that spreads refreshes over the cycle
+    this._thumbStagger = [];        // camera ids still to refresh in this cycle
+    this._thumbQueue   = [];        // camera ids waiting for a free request slot
+    this._thumbAborts  = new Map(); // camId -> AbortController for requests in flight
+    this._thumbLoading = new Set(); // per-camera guard: never two requests for one camera
+    this._gridWanted   = false;     // grid polling should run when the card is visible
+
+    // Visibility / lifecycle (polling only runs while attached, tab visible and on screen)
+    this._attached     = false;
+    this._onScreen     = true;      // updated by IntersectionObserver
+    this._io           = null;
+    this._loadRetryTimer = null;
+    this._onVisChange  = () => this._updatePolling();
     this._gridScrollTop  = 0;       // remembered scroll position
     this._offlineCams    = new Set();
     this._blockedCams    = new Set();
@@ -456,7 +451,10 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     this._playheadMs     = Date.now();
     this._mode           = "live";   // "live" | "archive"
     this._isPlaying      = false;
-    this._liveTimer      = null;     // interval for JPEG snapshot fallback
+    this._liveTimer      = null;     // setTimeout handle for the next JPEG fallback frame
+    this._livePolling    = false;    // JPEG fallback polling wanted (live mode, stream failed)
+    this._liveAbort      = null;     // AbortController of the frame request in flight
+    this._liveDelay      = LIVE_POLL_MS;
     this._liveStreamFail = false;    // true when live stream not supported by this DW build
     this._ignoreVidErr   = false;    // suppress stale video error events during live→archive switch
     this._webrtcPc       = null;     // RTCPeerConnection for live WebRTC
@@ -546,18 +544,19 @@ class DwSpectrumPlaybackCard extends HTMLElement {
 
   /* ── Data load */
   async _loadData() {
-    if (!this._hass) return;
+    if (!this._hass || this._loadInFlight) return;
+    this._loadInFlight = true;
     try {
       const res = await this._hass.callWS({ type: "dw_spectrum/get_info" });
       this._entries = res?.entries || [];
       // If HA is still starting up the integration may not be ready yet — retry after 5s
       if (!this._entries.length || !this._entries[0]?.media_token) {
-        setTimeout(() => this._loadData(), 5000);
+        this._scheduleLoadRetry();
         if (!this._entries.length) { this._view = "grid"; this._render(); return; }
       }
       const cfgId       = this._config?.entry_id;
       this._activeEntry = (cfgId && this._entries.find(e => e.entry_id === cfgId)) || this._entries[0];
-      this._cameras     = this._activeEntry.cameras || [];
+      this._cameras     = this._limitCams(this._activeEntry.cameras || []);
       this._blockedCams = new Set(this._cameras.filter(c => c.stream_blocked).map(c => c.id));
       this._view        = "grid";
       this._loadOfflineStates();
@@ -567,17 +566,56 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     } catch(err) {
       console.error("[DwCard] loadData:", err);
       this._view = "grid"; this._render();
-      setTimeout(() => this._loadData(), 5000);
+      this._scheduleLoadRetry();
+    } finally {
+      this._loadInFlight = false;
     }
+  }
+  _scheduleLoadRetry() {
+    clearTimeout(this._loadRetryTimer);
+    this._loadRetryTimer = null;
+    if (!this._attached) return;            // connectedCallback retries when re-attached
+    this._loadRetryTimer = setTimeout(() => { this._loadRetryTimer = null; this._loadData(); }, 5000);
+  }
+
+  /* ── Polling gate: attached + tab visible + card on screen */
+  _canPoll() {
+    return this._attached && !document.hidden && this._onScreen;
+  }
+  _updatePolling() {
+    if (this._canPoll()) this._resumePolling();
+    else this._pausePolling();
+  }
+  _pausePolling() {
+    // Live fallback: drop the pending timer and cancel the frame in flight.
+    clearTimeout(this._liveTimer); this._liveTimer = null;
+    if (this._liveAbort) { this._liveAbort.abort(); this._liveAbort = null; }
+    // Grid: drop timers + queue and cancel requests in flight.
+    this._haltGridThumbs();
+  }
+  _resumePolling() {
+    if (this._livePolling && !this._liveTimer && !this._liveAbort) this._scheduleLiveFrame(0);
+    if (this._gridWanted && !this._thumbTimer) this._refreshGridThumbs();
   }
 
   /* ── Grid thumbnails */
   _startGridThumbs() {
-    this._refreshGridThumbs();
-    clearInterval(this._thumbTimer);
-    this._thumbTimer = setInterval(() => this._refreshGridThumbs(), THUMB_REFRESH_MS);
+    this._haltGridThumbs();
+    this._gridWanted = true;
+    this._refreshGridThumbs();   // no-op until the card is attached, visible and on screen
   }
-  _stopGridThumbs() { clearInterval(this._thumbTimer); this._thumbTimer = null; }
+  _stopGridThumbs() {
+    this._gridWanted = false;
+    this._haltGridThumbs();
+  }
+  _haltGridThumbs() {
+    clearTimeout(this._thumbTimer);        this._thumbTimer = null;
+    clearTimeout(this._thumbStaggerTimer); this._thumbStaggerTimer = null;
+    this._thumbStagger = [];
+    this._thumbQueue   = [];
+    for (const ctrl of this._thumbAborts.values()) ctrl.abort();
+    this._thumbAborts.clear();
+  }
 
   /* Check HA entity states for Recording Status sensors to detect offline cameras */
   _loadOfflineStates() {
@@ -636,33 +674,62 @@ class DwSpectrumPlaybackCard extends HTMLElement {
       }
     }
     if (justUnblocked.length && this._view === "grid" && this._hass) {
-      const tok = this._hass.auth?.data?.access_token;
-      for (const camId of justUnblocked) {
-        if (!this._thumbLoading.has(camId)) {
-          this._thumbLoading.add(camId);
-          this._fetchGridThumb(camId, tok).finally(() => this._thumbLoading.delete(camId));
-        }
-      }
+      for (const camId of justUnblocked) this._queueThumb(camId);
     }
   }
 
-  async _refreshGridThumbs() {
+  /* One refresh cycle: cameras with no picture yet load first (3 at a time);
+     cameras that already have one are spread evenly over THUMB_REFRESH_MS. */
+  _refreshGridThumbs() {
+    clearTimeout(this._thumbTimer); this._thumbTimer = null;
+    if (!this._gridWanted || !this._canPoll()) return;     // _resumePolling restarts us
     if (!this._hass || !this._activeEntry || this._view !== "grid") return;
-    const tok = this._hass.auth?.data?.access_token;
-    for (const cam of this._cameras) {
-      if (this._thumbLoading.has(cam.id)) continue;
-      this._thumbLoading.add(cam.id);
-      this._fetchGridThumb(cam.id, tok).finally(() => this._thumbLoading.delete(cam.id));
+    const cams    = this._cameras.filter(c => !this._offlineCams.has(c.id) && !this._blockedCams.has(c.id));
+    const missing = cams.filter(c => !this._thumbUrls[c.id]).map(c => c.id);
+    const have    = cams.filter(c =>  this._thumbUrls[c.id]).map(c => c.id);
+    for (const id of missing) this._queueThumb(id);
+    clearTimeout(this._thumbStaggerTimer); this._thumbStaggerTimer = null;
+    this._thumbStagger = have;
+    const spacing = have.length ? Math.floor(THUMB_REFRESH_MS / have.length) : 0;
+    const step = () => {
+      this._thumbStaggerTimer = null;
+      if (!this._canPoll()) return;
+      const id = this._thumbStagger.shift();
+      if (id) this._queueThumb(id);
+      if (this._thumbStagger.length) this._thumbStaggerTimer = setTimeout(step, spacing);
+    };
+    if (have.length) step();
+    this._thumbTimer = setTimeout(() => this._refreshGridThumbs(), THUMB_REFRESH_MS);
+  }
+  _queueThumb(camId) {
+    if (this._thumbLoading.has(camId) || this._thumbQueue.includes(camId)) return;
+    this._thumbQueue.push(camId);
+    this._pumpThumbs();
+  }
+  _pumpThumbs() {
+    while (this._thumbAborts.size < THUMB_MAX_PARALLEL && this._thumbQueue.length && this._canPoll()) {
+      const camId = this._thumbQueue.shift();
+      if (this._thumbLoading.has(camId)) continue;
+      const ctrl = new AbortController();
+      this._thumbLoading.add(camId);
+      this._thumbAborts.set(camId, ctrl);
+      const tok = this._hass?.auth?.data?.access_token;
+      this._fetchGridThumb(camId, tok, ctrl.signal).finally(() => {
+        this._thumbLoading.delete(camId);
+        if (this._thumbAborts.get(camId) === ctrl) this._thumbAborts.delete(camId);
+        this._pumpThumbs();
+      });
     }
   }
-  async _fetchGridThumb(camId, tok) {
+  async _fetchGridThumb(camId, tok, signal) {
     if (this._offlineCams.has(camId)) return;
     if (this._blockedCams.has(camId)) return;
+    if (!this._activeEntry) return;
     try {
       const id  = cleanId(camId);
       const e = this._activeEntry;
       const url = `/api/dw_spectrum/${e.entry_id}/thumbnail/${id}?token=${e.media_token}`;
-      const res = await fetch(url, { headers: tok ? { Authorization: `Bearer ${tok}` } : {} });
+      const res = await fetch(url, { headers: tok ? { Authorization: `Bearer ${tok}` } : {}, signal });
       if (!res.ok) return;
       const blob = await res.blob();
       if (this._thumbUrls[camId]) URL.revokeObjectURL(this._thumbUrls[camId]);
@@ -677,13 +744,54 @@ class DwSpectrumPlaybackCard extends HTMLElement {
   }
 
   /* ── Entry switch */
+  /* Which cameras to show:
+       area:    an HA area id - the DW cameras whose HA device is in it (live)
+       cameras: DW camera names or ids
+     Neither set = every camera. */
+  _limitCams(list) {
+    const norm = x => String(x || "").trim().toLowerCase().replace(/[{}]/g, "");
+    const area = this._config && this._config.area;
+    let want = Array.isArray(this._config && this._config.cameras) ? this._config.cameras.map(norm).filter(Boolean) : [];
+    if (area) want = want.concat(DwSpectrumPlaybackCard.camerasInArea(this._hass, area).map(norm));
+    if (!want.length) return area ? [] : list;
+    return list.filter(c => want.includes(norm(c.name)) || want.includes(norm(c.id)));
+  }
+
+  /* DW camera names (= their HA device names) of one HA area. */
+  static camerasInArea(hass, areaId) {
+    if (!hass || !hass.entities || !areaId) return [];
+    const out = [];
+    for (const [id, ent] of Object.entries(hass.entities)) {
+      if (!ent || ent.platform !== "dw_spectrum" || !id.startsWith("camera.")) continue;
+      const dev = ent.device_id && hass.devices ? hass.devices[ent.device_id] : null;
+      if ((ent.area_id || (dev && dev.area_id)) !== areaId) continue;
+      const name = (dev && (dev.name || dev.name_by_user)) ||
+        (hass.states[id] && hass.states[id].attributes && hass.states[id].attributes.friendly_name) || id;
+      if (!out.includes(name)) out.push(name);
+    }
+    return out;
+  }
+
+  /* HA area name of a DW camera (matched by its HA device name). */
+  static areaOfCamera(hass, camName) {
+    if (!hass || !hass.entities) return "";
+    const want = String(camName || "").trim().toLowerCase();
+    for (const [id, ent] of Object.entries(hass.entities)) {
+      if (!ent || ent.platform !== "dw_spectrum" || !id.startsWith("camera.")) continue;
+      const dev = ent.device_id && hass.devices ? hass.devices[ent.device_id] : null;
+      if (!dev || String(dev.name || dev.name_by_user || "").trim().toLowerCase() !== want) continue;
+      const areaId = ent.area_id || dev.area_id;
+      return areaId && hass.areas && hass.areas[areaId] ? hass.areas[areaId].name : "";
+    }
+    return "";
+  }
   _switchEntry(id) {
     const e = this._entries.find(x => x.entry_id === id);
     if (!e || e === this._activeEntry) return;
     for (const u of Object.values(this._thumbUrls)) URL.revokeObjectURL(u);
     this._thumbUrls   = {};
     this._activeEntry = e;
-    this._cameras     = e.cameras || [];
+    this._cameras     = this._limitCams(e.cameras || []);
     this._view        = "grid";
     this._activeCam   = null;
     this._render();
@@ -790,8 +898,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
       }
     }
     this._mode = "live";
-    clearInterval(this._liveTimer);
-    this._liveTimer = null;
+    this._stopLivePoll();
 
     const img = this.shadowRoot.querySelector(".live-img");
     const vid = this.shadowRoot.querySelector(".arc-video");
@@ -813,8 +920,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
       if (img) img.style.display = "block";
       this._isPlaying = true;
       this._syncPlayBtn();
-      this._pollLiveFrame();
-      this._liveTimer = setInterval(() => this._pollLiveFrame(), LIVE_POLL_MS);
+      this._startLivePoll();
     }
 
     clearInterval(this._liveClockTimer);
@@ -828,9 +934,8 @@ class DwSpectrumPlaybackCard extends HTMLElement {
   }
 
   _stopLive() {
-    clearInterval(this._liveTimer);
+    this._stopLivePoll();
     clearInterval(this._liveClockTimer);
-    this._liveTimer      = null;
     this._liveClockTimer = null;
     this._stopWebRTC();
     const vid = this.shadowRoot.querySelector(".arc-video");
@@ -962,20 +1067,6 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     });
   }
 
-  /** Ask HA backend for a short-lived DW ticket for WebRTC auth. */
-  _fetchWebRtcTicket(entryId) {
-    return new Promise((resolve, reject) => {
-      if (!this._hass) { reject(new Error("no hass")); return; }
-      this._hass.connection.sendMessagePromise({
-        type: "dw_spectrum/get_webrtc_ticket",
-        entry_id: entryId,
-      }).then((res) => {
-        if (res && res.ticket) resolve(res.ticket);
-        else reject(new Error("no ticket in response"));
-      }).catch(reject);
-    });
-  }
-
   /** Stop and clean up any active WebRTC connection. */
   _stopWebRTC() {
     if (this._webrtcWs) {
@@ -1012,27 +1103,63 @@ class DwSpectrumPlaybackCard extends HTMLElement {
     vid.play().catch(() => {});
   }
 
+  /* ── Live JPEG fallback: one request at a time per camera.
+     The next frame is requested only after the previous one came back
+     (setTimeout chain, never setInterval). Slow / failed / stale frames
+     double the pause, up to LIVE_POLL_MAX_MS. */
+  _startLivePoll() {
+    this._stopLivePoll();
+    this._livePolling = true;
+    this._liveDelay   = LIVE_POLL_MS;
+    this._scheduleLiveFrame(0);
+  }
+  _stopLivePoll() {
+    this._livePolling = false;
+    clearTimeout(this._liveTimer); this._liveTimer = null;
+    if (this._liveAbort) { this._liveAbort.abort(); this._liveAbort = null; }
+  }
+  _scheduleLiveFrame(delay) {
+    clearTimeout(this._liveTimer); this._liveTimer = null;
+    if (!this._livePolling || !this._canPoll()) return;   // _resumePolling restarts us
+    this._liveTimer = setTimeout(() => { this._liveTimer = null; this._pollLiveFrame(); }, delay);
+  }
   async _pollLiveFrame() {
+    if (!this._livePolling || this._liveAbort) return;     // never two in flight
     if (!this._hass || !this._activeEntry || !this._activeCam) return;
-    if (this._mode !== "live") return;
+    if (this._mode !== "live" || !this._canPoll()) return;
+    const ctrl = new AbortController();
+    this._liveAbort = ctrl;
+    const t0 = performance.now();
+    let good = false;
     try {
       const tok = this._hass.auth?.data?.access_token;
       const id  = cleanId(this._activeCam.id);
       const e2 = this._activeEntry;
-      const url = `/api/dw_spectrum/${e2.entry_id}/thumbnail/${id}?token=${e2.media_token}&_t=${Date.now()}`;
-      const res = await fetch(url, { headers: tok ? { Authorization: `Bearer ${tok}` } : {} });
-      if (!res.ok) return;
-      const blob = await res.blob();
-      const burl  = URL.createObjectURL(blob);
-      if (this._mode !== "live") { URL.revokeObjectURL(burl); return; }
-      const img   = this.shadowRoot.querySelector(".live-img");
-      if (img) {
-        const old = img.src;
-        img.src   = burl;
-        if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+      const url = `/api/dw_spectrum/${e2.entry_id}/thumbnail/${id}?token=${e2.media_token}`;
+      const res = await fetch(url, { headers: tok ? { Authorization: `Bearer ${tok}` } : {}, signal: ctrl.signal });
+      if (res.ok) {
+        const blob = await res.blob();
+        const stale = res.headers.get("X-DW-Thumbnail-Stale") === "1";
+        if (this._mode === "live" && !ctrl.signal.aborted) {
+          const burl = URL.createObjectURL(blob);
+          const img  = this.shadowRoot.querySelector(".live-img");
+          if (img) {
+            const old = img.src;
+            img.src   = burl;
+            if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+          } else URL.revokeObjectURL(burl);
+          this._setVidStatus("");
+        }
+        good = !stale;
       }
-      this._setVidStatus("");
     } catch(_) {}
+    if (this._liveAbort === ctrl) this._liveAbort = null;
+    if (ctrl.signal.aborted) return;                       // stopped / paused meanwhile
+    const took = performance.now() - t0;
+    this._liveDelay = (good && took < LIVE_SLOW_MS)
+      ? LIVE_POLL_MS
+      : Math.min(Math.max(this._liveDelay, LIVE_POLL_MS) * 2, LIVE_POLL_MAX_MS);
+    this._scheduleLiveFrame(this._liveDelay);
   }
 
   /* ── Archive mode (MP4 via DW media endpoint) */
@@ -1916,9 +2043,7 @@ class DwSpectrumPlaybackCard extends HTMLElement {
           if (img) img.style.display = "block";
           this._isPlaying = true;
           this._syncPlayBtn();
-          clearInterval(this._liveTimer);
-          this._pollLiveFrame();
-          this._liveTimer = setInterval(() => this._pollLiveFrame(), LIVE_POLL_MS);
+          this._startLivePoll();
           return;
         }
         this._setVidStatus(this._hasFootage === false ? "No archive available for this camera." : "Playback error — check DW server URL and credentials.");
@@ -2015,17 +2140,39 @@ class DwSpectrumPlaybackCard extends HTMLElement {
   }
 
   connectedCallback() {
+    this._attached = true;
     this._resizeObserver = new ResizeObserver(() => this._drawTimeline());
     this._resizeObserver.observe(this);
+    document.addEventListener("visibilitychange", this._onVisChange);
+    if ("IntersectionObserver" in window) {
+      this._onScreen = false;   // wait for the first observer report before polling
+      this._io = new IntersectionObserver(entries => {
+        const last = entries[entries.length - 1];
+        this._onScreen = !!last?.isIntersecting;
+        this._updatePolling();
+      });
+      this._io.observe(this);
+    } else {
+      this._onScreen = true;
+    }
+    // Re-attached card: pick up where it left off.
+    if (this._hass && !this._activeEntry) this._loadData();
+    else if (this._view === "grid" && this._activeEntry) this._startGridThumbs();
+    else if (this._view === "detail" && this._activeCam && this._mode === "live") {
+      requestAnimationFrame(() => { if (this._attached) this._startLive(); });
+    }
   }
 
   disconnectedCallback() {
+    this._attached = false;
+    clearTimeout(this._loadRetryTimer); this._loadRetryTimer = null;
+    document.removeEventListener("visibilitychange", this._onVisChange);
+    if (this._io) { this._io.disconnect(); this._io = null; }
     this._stopGridThumbs();
     this._stopLive();
     this._stopArchiveVideo();
     clearTimeout(this._motionJumpTimer);
     clearInterval(this._liveClockTimer);
-    this._thumbUrls = {};
     if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
   }
 }
@@ -2046,7 +2193,86 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
     this._render();
   }
 
-  set hass(_) {}
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) {
+      this._render();
+      this._loadCameras();
+    }
+  }
+
+  /* Every DW camera name, from all DW servers (for the checkbox list). */
+  async _loadCameras() {
+    if (!this._hass || this._camsLoading) return;
+    this._camsLoading = true;
+    try {
+      const res = await this._hass.callWS({ type: "dw_spectrum/get_info" });
+      const names = [];
+      for (const e of (res && res.entries) || []) {
+        for (const cam of e.cameras || []) if (cam && cam.name && !names.includes(cam.name)) names.push(cam.name);
+      }
+      this._camNames = names.sort((a, b) => a.localeCompare(b));
+    } catch (err) {
+      this._camNames = [];
+      this._camError = true;
+    }
+    this._render();
+  }
+
+  _cameraMode() {
+    const c = this._config;
+    if (c.area) return "area";
+    if (Array.isArray(c.cameras) && c.cameras.length) return "pick";
+    return this._mode || "all";
+  }
+
+  _camerasHtml() {
+    const c = this._config;
+    const mode = this._cameraMode();
+    const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const hass = this._hass;
+    let html = `
+      <div class="section">Cameras</div>
+      <div class="row"><label>Show</label>
+        <select id="cam_mode">
+          <option value="all" ${mode === "all" ? "selected" : ""}>All cameras</option>
+          <option value="area" ${mode === "area" ? "selected" : ""}>Cameras in an area</option>
+          <option value="pick" ${mode === "pick" ? "selected" : ""}>Pick cameras</option>
+        </select></div>`;
+    if (mode === "area") {
+      const areas = hass && hass.areas ? Object.values(hass.areas).sort((a, b) => String(a.name).localeCompare(String(b.name))) : [];
+      const inArea = c.area ? DwSpectrumPlaybackCard.camerasInArea(hass, c.area) : [];
+      html += `
+      <div class="row"><label>Area</label>
+        <select id="cam_area">
+          <option value="" ${!c.area ? "selected" : ""}>Select an area...</option>
+          ${areas.map(a => `<option value="${esc(a.area_id)}" ${c.area === a.area_id ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+        </select></div>
+      <div class="hint">${!c.area ? "Pick an area - the card shows its DW cameras and follows area changes automatically."
+        : inArea.length ? "Shows: " + inArea.map(esc).join(", ") : "No DW cameras in this area yet."}</div>`;
+    } else if (mode === "pick") {
+      const picked = (Array.isArray(c.cameras) ? c.cameras : []).map(x => String(x).trim().toLowerCase());
+      const names = this._camNames;
+      if (!names) {
+        html += `<div class="hint">Loading cameras...</div>`;
+      } else if (!names.length) {
+        html += `<div class="hint">${this._camError ? "Could not load the camera list from the DW Spectrum integration." : "No cameras found."}</div>`;
+      } else {
+        html += `
+      <div class="cam-tools"><span>${picked.length ? picked.length + " selected" : "None selected = all cameras"}</span>
+        <span><button type="button" id="cam_all">Select all</button><button type="button" id="cam_none">Clear</button></span></div>
+      <div class="cam-list">
+        ${names.map(n => {
+          const area = DwSpectrumPlaybackCard.areaOfCamera(hass, n);
+          return `<label class="cam-row"><input type="checkbox" class="cam-pick" data-name="${esc(n)}" ${picked.includes(n.toLowerCase()) ? "checked" : ""}>
+            <span class="cam-name">${esc(n)}</span>${area ? `<span class="cam-area">${esc(area)}</span>` : ""}</label>`;
+        }).join("")}
+      </div>`;
+      }
+    }
+    return html;
+  }
 
   _fire(config) {
     this.dispatchEvent(new CustomEvent("config-changed", {
@@ -2082,7 +2308,25 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
           border-radius: 4px; padding: 4px 8px; font-size: 14px; min-width: 110px;
         }
         input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; accent-color: var(--primary-color, #03a9f4); }
+        .hint { font-size: 12px; color: var(--secondary-text-color, #888); padding: 6px 0 10px;
+          border-bottom: 1px solid var(--divider-color, #eee); }
+        .cam-tools { display: flex; align-items: center; justify-content: space-between; padding: 8px 0 6px;
+          font-size: 12px; color: var(--secondary-text-color, #888); }
+        .cam-tools button {
+          background: var(--card-background-color, #fff); color: var(--primary-text-color, #333);
+          border: 1px solid var(--divider-color, #ccc); border-radius: 4px; padding: 3px 8px;
+          font-size: 12px; margin-left: 6px; cursor: pointer;
+        }
+        .cam-list { max-height: 260px; overflow-y: auto; border: 1px solid var(--divider-color, #eee);
+          border-radius: 4px; margin-bottom: 4px; }
+        .cam-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; cursor: pointer;
+          border-bottom: 1px solid var(--divider-color, #eee); }
+        .cam-row:last-child { border-bottom: none; }
+        .cam-name { flex: 1; font-size: 14px; color: var(--primary-text-color, #333); }
+        .cam-area { font-size: 12px; color: var(--secondary-text-color, #888); }
       </style>
+
+      ${this._camerasHtml()}
 
       <div class="section">Buttons</div>
       <div class="row"><label>Show Download button</label>
@@ -2119,7 +2363,7 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
         </select></div>
     `;
 
-    const update = () => this._fire({
+    const update = () => this._fire(this._withCameras({
       ...this._config,
       show_download:    this.shadowRoot.getElementById("show_download").checked,
       show_calendar:    this.shadowRoot.getElementById("show_calendar").checked,
@@ -2129,11 +2373,47 @@ class DwSpectrumPlaybackCardEditor extends HTMLElement {
       show_search:      this.shadowRoot.getElementById("show_search").checked,
       show_badges:      this.shadowRoot.getElementById("show_badges").checked,
       cameras_per_row:  Number(this.shadowRoot.getElementById("cameras_per_row").value),
-    });
+    }));
 
     this.shadowRoot.querySelectorAll("input, select").forEach(el =>
       el.addEventListener("change", update)
     );
+    const setAll = on => {
+      this.shadowRoot.querySelectorAll(".cam-pick").forEach(cb => { cb.checked = on; });
+      update();
+    };
+    const allBtn = this.shadowRoot.getElementById("cam_all");
+    if (allBtn) allBtn.addEventListener("click", () => setAll(true));
+    const noneBtn = this.shadowRoot.getElementById("cam_none");
+    if (noneBtn) noneBtn.addEventListener("click", () => setAll(false));
+  }
+
+  /* Camera filter from the Cameras section: only `area` or only `cameras`. */
+  _withCameras(cfg) {
+    const out = { ...cfg };
+    const modeEl = this.shadowRoot.getElementById("cam_mode");
+    const mode = modeEl ? modeEl.value : "all";
+    const prevMode = this._cameraMode();
+    this._mode = mode;
+    delete out.area;
+    delete out.cameras;
+    if (mode === "area") {
+      const areaEl = this.shadowRoot.getElementById("cam_area");
+      const area = areaEl ? areaEl.value : (this._config.area || "");
+      if (area) out.area = area;
+    } else if (mode === "pick") {
+      const boxes = this.shadowRoot.querySelectorAll(".cam-pick");
+      const names = boxes.length
+        ? [...boxes].filter(cb => cb.checked).map(cb => cb.dataset.name)
+        : (Array.isArray(this._config.cameras) ? this._config.cameras : []);
+      if (names.length) out.cameras = names;
+    }
+    // A mode switch re-renders right away (the area / checkbox rows change).
+    if (mode !== prevMode) {
+      this._config = out;
+      this._render();
+    }
+    return out;
   }
 }
 
